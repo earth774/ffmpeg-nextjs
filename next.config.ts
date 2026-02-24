@@ -1,7 +1,16 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  serverExternalPackages: [
+    "@ffprobe-installer/ffprobe",
+    "@ffprobe-installer/darwin-arm64",
+    "@ffprobe-installer/darwin-x64",
+  ],
+  experimental: {
+    serverActions: {
+      bodySizeLimit: "500mb",
+    },
+  },
 };
 
 export default nextConfig;
