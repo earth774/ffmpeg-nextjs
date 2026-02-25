@@ -92,8 +92,9 @@ export async function POST(request: NextRequest) {
     writeFileSync(rawPath, buffer);
     unlinkSync(file.filepath);
   } catch (e) {
+    console.error("File save error:", e);
     return Response.json(
-      { error: "Failed to save file" },
+      { error: "Failed to save file", details: String(e) },
       { status: 500 }
     );
   }
@@ -105,8 +106,9 @@ export async function POST(request: NextRequest) {
       status: "processing",
     }).run();
   } catch (e) {
+    console.error("Database insert error:", e);
     return Response.json(
-      { error: "Failed to create record" },
+      { error: "Failed to create record", details: String(e) },
       { status: 500 }
     );
   }

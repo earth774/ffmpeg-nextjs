@@ -1,5 +1,5 @@
 import { join } from "path";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { execSync } from "child_process";
 import os from "os";
 import ffmpeg from "fluent-ffmpeg";
@@ -7,7 +7,7 @@ import ffmpegStatic from "ffmpeg-static";
 import ffprobeInstaller from "@ffprobe-installer/ffprobe";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { videos } from "@/db/schema";
+import { videos, RESOLUTIONS, type Resolution } from "@/db/schema";
 
 function resolveFfmpegPath(): string | null {
   if (ffmpegStatic && existsSync(ffmpegStatic)) {
@@ -81,10 +81,161 @@ export function getMeta(path: string): Promise<VideoMetadata> {
   });
 }
 
-export function transcodeToHLS(
-  videoId: string,
-  rawPath: string
+// Generate master playlist that includes all resolutions
+function generateMasterPlaylist(
+  hlsDir: string,
+  availableResolutions: { resolution: Resolution; bandwidth: number }[]
+): void {
+  const masterPlaylistPath = join(hlsDir, "index.m3u8");
+
+  let playlist = "#EXTM3U\n";
+  playlist += "#EXT-X-VERSION:3\n\n";
+
+  // Sort by bandwidth (resolution quality)
+  const sorted = [...availableResolutions].sort((a, b) => a.bandwidth - b.bandwidth);
+
+  for (const { resolution, bandwidth } of sorted) {
+    playlist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution.width}x${resolution.height}\n`;
+    playlist += `${resolution.name}/index.m3u8\n\n`;
+  }
+
+  writeFileSync(masterPlaylistPath, playlist);
+  console.log(`[FFmpeg] Master playlist created at ${masterPlaylistPath}`);
+}
+
+// Helper function to run ffmpeg for a specific resolution
+async function transcodeResolution(
+  rawPath: string,
+  resolution: Resolution,
+  outputDir: string,
+  videoCodec: string,
+  isHardwareAccel: boolean,
+  audioMode: "normal" | "filtered" | "aggressive" | "copy" | "none"
 ): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const outputM3u8 = join(outputDir, "index.m3u8");
+    const segmentPattern = join(outputDir, "seg_%03d.ts");
+
+    // Scale filter - maintain aspect ratio
+    const scaleFilter = `scale=${resolution.width}:${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2`;
+
+    const outputOptions = [
+      `-c:v ${videoCodec}`,
+      // Video scaling and bitrate
+      `-vf ${scaleFilter}`,
+      `-b:v ${resolution.videoBitrate}`,
+      `-maxrate ${resolution.videoBitrate}`,
+      `-bufsize ${parseInt(resolution.videoBitrate) * 2}k`,
+      // Audio handling
+      audioMode === "none" ? "-an" : audioMode === "copy" ? "-c:a copy" : "-c:a aac",
+      ...(audioMode !== "none" && audioMode !== "copy"
+        ? [`-b:a ${resolution.audioBitrate}`, "-ac 2", "-ar 48000"]
+        : []),
+      // HLS options
+      "-hls_time 10",
+      "-hls_list_size 0",
+      `-hls_segment_filename ${segmentPattern}`,
+      "-f hls",
+      "-max_muxing_queue_size 1024",
+      "-threads 4",
+      "-y",
+    ];
+
+    // Add audio filter based on mode
+    if (audioMode === "filtered") {
+      outputOptions.push(
+        "-af",
+        "aformat=channel_layouts=stereo,pan=stereo|c0=c0|c1=c1,aresample=async=1000:min_hard_comp=0.100000:first_pts=0"
+      );
+    } else if (audioMode === "aggressive") {
+      outputOptions.push(
+        "-filter_complex",
+        "[0:a:0]pan=stereo|c0=c0|c1=c1[aout]",
+        "-map",
+        "0:v:0",
+        "-map",
+        "[aout]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        resolution.audioBitrate,
+        "-ar",
+        "48000"
+      );
+    }
+
+    // Software encoding quality settings
+    if (!isHardwareAccel) {
+      outputOptions.push("-crf 28", "-preset superfast");
+    }
+
+    let inputOptions: string[] = [];
+
+    if (audioMode === "normal") {
+      inputOptions = ["-fflags +discardcorrupt+genpts"];
+    } else if (audioMode === "filtered") {
+      inputOptions = ["-fflags +discardcorrupt+genpts", "-err_detect ignore_err"];
+    } else if (audioMode === "aggressive") {
+      inputOptions = [
+        "-fflags +discardcorrupt+genpts+igndts+nofillin",
+        "-err_detect ignore_err+ignore_defer+ignore_decode",
+        "-copyts",
+        "-start_at_zero",
+      ];
+    } else if (audioMode === "copy") {
+      inputOptions = ["-fflags +discardcorrupt"];
+    }
+
+    ffmpeg(rawPath)
+      .inputOptions(inputOptions)
+      .outputOptions(outputOptions)
+      .output(outputM3u8)
+      .on("start", (cmd) => {
+        console.log(`[FFmpeg] ${resolution.name} transcode started`);
+      })
+      .on("end", () => {
+        console.log(`[FFmpeg] ${resolution.name} transcode completed`);
+        resolve();
+      })
+      .on("error", (err) => {
+        console.error(`[FFmpeg] ${resolution.name} transcode error:`, err.message);
+        reject(err);
+      })
+      .run();
+  });
+}
+
+// Try transcoding with different audio modes until one succeeds
+async function tryTranscodeWithFallback(
+  rawPath: string,
+  resolution: Resolution,
+  outputDir: string,
+  videoCodec: string,
+  isHardwareAccel: boolean
+): Promise<boolean> {
+  const modes: ("normal" | "copy" | "filtered" | "aggressive" | "none")[] = [
+    "normal",
+    "copy",
+    "filtered",
+    "aggressive",
+    "none",
+  ];
+
+  for (const mode of modes) {
+    try {
+      console.log(`[FFmpeg] Trying ${resolution.name} with audio mode: ${mode}`);
+      await transcodeResolution(rawPath, resolution, outputDir, videoCodec, isHardwareAccel, mode);
+      return true;
+    } catch (err) {
+      console.warn(`[FFmpeg] ${resolution.name} ${mode} mode failed, trying next...`);
+      // Continue to next mode
+    }
+  }
+
+  return false;
+}
+
+export function transcodeToHLS(videoId: string, rawPath: string): Promise<void> {
   if (!ffmpegPath) {
     const err = new Error(
       "FFmpeg not found. Install it (e.g. brew install ffmpeg) or ensure ffmpeg-static binary exists."
@@ -96,83 +247,13 @@ export function transcodeToHLS(
   const uploadsDir = join(process.cwd(), "uploads");
   const hlsDir = join(uploadsDir, "hls", videoId);
   const thumbsDir = join(uploadsDir, "thumbs");
-  const outputM3u8 = join(hlsDir, "index.m3u8");
-  const segmentPattern = join(hlsDir, "seg_%03d.ts");
   const thumbPath = join(thumbsDir, `${videoId}.jpg`);
 
   mkdirSync(hlsDir, { recursive: true });
+  mkdirSync(thumbsDir, { recursive: true });
 
   const videoCodec = getVideoCodec();
   const isHardwareAccel = videoCodec !== "libx264";
-
-  // Helper function to run ffmpeg with given options
-  const runFfmpeg = (audioMode: "normal" | "filtered" | "aggressive" | "copy" | "none"): Promise<void> => {
-    return new Promise((resolve, reject) => {
-      const outputOptions = [
-        `-c:v ${videoCodec}`,
-        audioMode === "none" ? "-an" : audioMode === "copy" ? "-c:a copy" : "-c:a aac", // Audio handling
-        ...(audioMode !== "none" && audioMode !== "copy" ? ["-b:a 128k", "-ac 2", "-ar 48000"] : []),
-        "-hls_time 10",
-        "-hls_list_size 0",
-        `-hls_segment_filename ${segmentPattern}`,
-        "-f hls",
-        "-max_muxing_queue_size 1024",
-        "-threads 4",
-        "-y",
-      ];
-
-      // Add audio filter based on mode
-      if (audioMode === "filtered") {
-        // Standard audio filter for problematic audio
-        outputOptions.push(
-          "-af aformat=channel_layouts=stereo,pan=stereo|c0=c0|c1=c1,aresample=async=1000:min_hard_comp=0.100000:first_pts=0"
-        );
-      } else if (audioMode === "aggressive") {
-        // Use filter_complex for more control over problematic audio
-        outputOptions.push(
-          "-filter_complex", "[0:a:0]pan=stereo|c0=c0|c1=c1[aout]",
-          "-map", "0:v:0",
-          "-map", "[aout]",
-          "-c:a", "aac",
-          "-b:a", "128k",
-          "-ar", "48000"
-        );
-      }
-
-      if (!isHardwareAccel) {
-        outputOptions.push("-crf 28", "-preset superfast");
-      }
-
-      let inputOptions: string[] = [];
-
-      if (audioMode === "normal") {
-        inputOptions = ["-fflags +discardcorrupt+genpts"];
-      } else if (audioMode === "filtered") {
-        inputOptions = [
-          "-fflags +discardcorrupt+genpts",
-          "-err_detect ignore_err",
-        ];
-      } else if (audioMode === "aggressive") {
-        // Most aggressive error recovery - don't probe audio format
-        inputOptions = [
-          "-fflags +discardcorrupt+genpts+igndts+nofillin",
-          "-err_detect ignore_err+ignore_defer+ignore_decode",
-          "-copyts",
-          "-start_at_zero",
-        ];
-      } else if (audioMode === "copy") {
-        inputOptions = ["-fflags +discardcorrupt"];
-      }
-
-      ffmpeg(rawPath)
-        .inputOptions(inputOptions)
-        .outputOptions(outputOptions)
-        .output(outputM3u8)
-        .on("end", () => resolve())
-        .on("error", (err) => reject(err))
-        .run();
-    });
-  };
 
   // Helper to create thumbnail
   const createThumbnail = async (): Promise<void> => {
@@ -190,47 +271,80 @@ export function transcodeToHLS(
     });
   };
 
-  // Execute transcode with fallback: normal -> copy -> filtered -> aggressive -> no audio
   return new Promise((resolve, reject) => {
     const executeTranscode = async () => {
       try {
-        // Try 1: Normal transcode
-        try {
-          console.log("[FFmpeg] Trying normal transcode...");
-          await runFfmpeg("normal");
-        } catch {
-          // Try 2: Copy audio without re-encoding (for already encoded audio)
-          console.warn("[FFmpeg] Normal failed, trying audio copy...");
-          try {
-            await runFfmpeg("copy");
-          } catch {
-            // Try 3: With audio filters for problematic audio
-            console.warn("[FFmpeg] Copy failed, trying with audio filters...");
-            try {
-              await runFfmpeg("filtered");
-            } catch {
-              // Try 4: Aggressive audio recovery with filter_complex
-              console.warn("[FFmpeg] Filters failed, trying aggressive recovery...");
-              try {
-                await runFfmpeg("aggressive");
-              } catch {
-                // Try 5: Video only (no audio)
-                console.warn("[FFmpeg] Aggressive recovery failed, transcoding without audio...");
-                await runFfmpeg("none");
-              }
-            }
+        // Get original video metadata
+        const meta = await getMeta(rawPath);
+        const originalWidth = meta.width;
+        const originalHeight = meta.height;
+
+        // Filter resolutions that are <= original resolution
+        const targetResolutions = RESOLUTIONS.filter((r) => {
+          // Include resolution if original is larger or equal
+          return originalWidth >= r.width || originalHeight >= r.height;
+        });
+
+        // Always include at least the lowest resolution
+        if (targetResolutions.length === 0) {
+          targetResolutions.push(RESOLUTIONS[RESOLUTIONS.length - 1]);
+        }
+
+        console.log(
+          `[FFmpeg] Transcoding to ${targetResolutions.length} resolutions:`,
+          targetResolutions.map((r) => r.name).join(", ")
+        );
+
+        // Transcode each resolution
+        const successfulResolutions: { resolution: Resolution; bandwidth: number }[] = [];
+        const resolutionPaths: Record<string, string | null> = {};
+
+        for (const resolution of targetResolutions) {
+          const resolutionDir = join(hlsDir, resolution.name);
+          mkdirSync(resolutionDir, { recursive: true });
+
+          const success = await tryTranscodeWithFallback(
+            rawPath,
+            resolution,
+            resolutionDir,
+            videoCodec,
+            isHardwareAccel
+          );
+
+          if (success) {
+            // Calculate bandwidth (bits per second) - video bitrate + audio bitrate
+            const videoKbps = parseInt(resolution.videoBitrate);
+            const audioKbps = parseInt(resolution.audioBitrate);
+            const bandwidth = (videoKbps + audioKbps) * 1000;
+
+            successfulResolutions.push({ resolution, bandwidth });
+            resolutionPaths[`hlsPath${resolution.name}`] = join("hls", videoId, resolution.name, "index.m3u8");
+          } else {
+            console.error(`[FFmpeg] Failed to transcode ${resolution.name}`);
+            resolutionPaths[`hlsPath${resolution.name}`] = null;
           }
         }
 
-        // Get metadata and create thumbnail
-        const meta = await getMeta(rawPath);
+        if (successfulResolutions.length === 0) {
+          throw new Error("Failed to transcode any resolution");
+        }
+
+        // Generate master playlist
+        generateMasterPlaylist(hlsDir, successfulResolutions);
+
+        // Create thumbnail
         await createThumbnail();
 
-        // Update database
+        // Update database with all resolution paths
         db.update(videos)
           .set({
             status: "ready",
             hlsPath: join("hls", videoId, "index.m3u8"),
+            hlsPath1080p: resolutionPaths.hlsPath1080p,
+            hlsPath720p: resolutionPaths.hlsPath720p,
+            hlsPath480p: resolutionPaths.hlsPath480p,
+            hlsPath360p: resolutionPaths.hlsPath360p,
+            hlsPath240p: resolutionPaths.hlsPath240p,
             thumbPath: join("thumbs", `${videoId}.jpg`),
             duration: meta.duration,
             width: meta.width,
@@ -238,14 +352,16 @@ export function transcodeToHLS(
           })
           .where(eq(videos.id, videoId))
           .run();
-        
+
+        console.log(
+          `[FFmpeg] Transcoding complete. Available resolutions:`,
+          successfulResolutions.map((r) => r.resolution.name).join(", ")
+        );
+
         resolve();
       } catch (e) {
         console.error("[FFmpeg] Final transcode error:", e);
-        db.update(videos)
-          .set({ status: "error" })
-          .where(eq(videos.id, videoId))
-          .run();
+        db.update(videos).set({ status: "error" }).where(eq(videos.id, videoId)).run();
         reject(e);
       }
     };

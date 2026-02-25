@@ -6,6 +6,13 @@ import { VideoPlayer } from "./VideoPlayer";
 const ALLOWED_TYPES = ["video/mp4", "video/webm", "video/quicktime"];
 const MAX_SIZE = 500 * 1024 * 1024; // 500MB
 
+interface ResolutionInfo {
+  name: string;
+  width: number;
+  height: number;
+  hlsUrl: string;
+}
+
 type UploadState =
   | { phase: "idle" }
   | { phase: "uploading"; progress: number }
@@ -16,6 +23,7 @@ type UploadState =
       hlsUrl: string;
       thumbUrl: string | null;
       downloadUrl: string;
+      resolutions: ResolutionInfo[];
     }
   | { phase: "error"; message: string };
 
@@ -93,6 +101,7 @@ export function VideoUploader() {
           hlsUrl: string | null;
           thumbUrl: string | null;
           downloadUrl?: string;
+          resolutions?: ResolutionInfo[];
         };
 
         if (data.status === "ready" && data.hlsUrl) {
@@ -103,6 +112,7 @@ export function VideoUploader() {
             hlsUrl: data.hlsUrl,
             thumbUrl: data.thumbUrl,
             downloadUrl: data.downloadUrl ?? `/api/video/${videoId}/download`,
+            resolutions: data.resolutions ?? [],
           });
         } else if (data.status === "error") {
           clearInterval(interval);
@@ -205,6 +215,7 @@ export function VideoUploader() {
             hlsUrl={state.hlsUrl}
             thumbUrl={state.thumbUrl}
             downloadUrl={state.downloadUrl}
+            resolutions={state.resolutions}
           />
           <button
             onClick={reset}

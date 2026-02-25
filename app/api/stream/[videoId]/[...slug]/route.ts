@@ -12,6 +12,9 @@ const MIME_TYPES: Record<string, string> = {
   ".jpeg": "image/jpeg",
 };
 
+// Valid resolution names
+const VALID_RESOLUTIONS = ["1080p", "720p", "480p", "360p", "240p"];
+
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ videoId: string; slug: string[] }> }
@@ -34,7 +37,18 @@ export async function GET(
   if (filename === "thumb.jpg" || filename === "thumb.jpeg") {
     filePath = join(process.cwd(), "uploads", "thumbs", `${videoId}.jpg`);
   } else {
-    filePath = join(process.cwd(), "uploads", "hls", videoId, filename);
+    // Check if the path contains a resolution subdirectory (e.g., "1080p/index.m3u8")
+    const pathParts = filename.split("/");
+    const hasResolutionSubdir =
+      pathParts.length >= 2 && VALID_RESOLUTIONS.includes(pathParts[0]);
+
+    if (hasResolutionSubdir) {
+      // Path: hls/{videoId}/{resolution}/{file}
+      filePath = join(process.cwd(), "uploads", "hls", videoId, filename);
+    } else {
+      // Path: hls/{videoId}/{file} (master playlist or old format)
+      filePath = join(process.cwd(), "uploads", "hls", videoId, filename);
+    }
   }
 
   if (!existsSync(filePath)) {
